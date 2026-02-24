@@ -6,7 +6,10 @@ using System.Buffers;
 #endif
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
 using System.Numerics;
+using System.Reflection;
 
 #endregion
 
@@ -48,13 +51,16 @@ namespace MaxMind.Db
         private readonly DictionaryActivatorCreator _dictionaryActivatorCreator;
         private readonly ListActivatorCreator _listActivatorCreator;
 
+        private readonly IAllocatorFactory? _allocatorFactory;
+
         /// <summary>
         ///     Initializes a new instance of the <see cref="Decoder" /> class.
         /// </summary>
         /// <param name="database">The database.</param>
         /// <param name="pointerBase">The base address in the stream.</param>
         /// <param name="followPointers">Whether to follow pointers. For testing.</param>
-        internal Decoder(Buffer database, long pointerBase, bool followPointers = true)
+        /// <param name="factory">Optional allocator factory.</param>
+        internal Decoder(Buffer database, long pointerBase, bool followPointers = true, IAllocatorFactory? factory = null)
         {
             _pointerBase = pointerBase;
             _database = database;
@@ -62,6 +68,7 @@ namespace MaxMind.Db
             _listActivatorCreator = new ListActivatorCreator();
             _dictionaryActivatorCreator = new DictionaryActivatorCreator();
             _typeAcivatorCreator = new TypeAcivatorCreator();
+            _allocatorFactory = factory;
         }
 
         /// <summary>
@@ -80,6 +87,510 @@ namespace MaxMind.Db
             }
             return decoded;
         }
+
+#if NET10_0_OR_GREATER
+
+        /// <summary>
+        ///     Decodes the object at the specified offset.
+        /// </summary>
+        /// <param name="offset">The offset.</param>
+        /// <param name="outOffset">The out offset</param>
+        /// <param name="returnValue">Object to return</param>
+        /// <param name="injectables"></param>
+        /// <param name="network"></param>
+        internal bool DecodeCityResponse(out ValueCityResponse returnValue, long offset, out long outOffset, InjectableValues? injectables = null, Network? network = default)
+        {
+            var type = CtrlData(offset, out var size, out offset);
+
+            if (type != ObjectType.Map)
+            {
+                returnValue = default;
+                outOffset = 0;
+                return false;
+            }
+
+            outOffset = 0;
+            returnValue = new();
+
+            for (int index = 0; index < 5; ++index)
+            {
+                // We start by building the high level map. It is a map of maps.
+                Key key = DecodeKey(offset, out offset);
+                type = CtrlData(offset, out size, out offset);
+
+                long pointerOffset = offset;
+                bool readPointer = false;
+                if (type == ObjectType.Pointer)
+                {
+                    readPointer = true;
+                    long pointer = offset;
+                    pointer = DecodePointer(offset, size, out offset);
+                    Debug.Assert(_followPointers);
+                    type = CtrlData(pointer, out size, out pointerOffset);
+                    offset = pointerOffset;
+                }
+
+                // First type is a map.
+                Debug.Assert(type == ObjectType.Map || type == ObjectType.Pointer);
+
+                using PooledArray<byte> routeBuffer = new(8);
+                if (key.Equals("country"u8))
+                {
+                    // We are decoding the country object.
+                    ValueCountry country = new ();
+                    
+                    int paramCount = size;
+                    for (int decodeParameterIndex = 0; decodeParameterIndex < paramCount; ++decodeParameterIndex)
+                    {
+                        key = DecodeKey(offset, out offset);
+                        type = CtrlData(offset, out size, out offset);
+
+                        if (type != ObjectType.Map)
+                        {
+                            DecodeState state = country.TryAssignToParameter(key.AsSpan(), null, out int _, out var assignmentLambda);
+                            if (assignmentLambda is null || state != DecodeState.Assigned)
+                            {
+                                throw new DeserializationException("Type incorrect");
+                            }
+
+                            pointerOffset = offset;
+                            readPointer = false;
+                            if (type == ObjectType.Pointer)
+                            {
+                                readPointer = true;
+                                long pointer = offset;
+                                pointer = DecodePointer(offset, size, out offset);
+                                Debug.Assert(_followPointers);
+                                type = CtrlData(pointer, out size, out pointerOffset);
+                            }
+
+                            Debug.Assert(state == DecodeState.Assigned && assignmentLambda is not null);
+                            assignmentLambda(null, ref country, _database.AsMemory(pointerOffset, size));
+
+                            if (!readPointer)
+                            {
+                                offset += size;
+                            }
+                        }
+                        else
+                        {
+                            // This is a complex object. Call TryAssignToParameter. Assert
+                            // that the complex type is initialized, but not assigned.
+                            DecodeState state = country.TryAssignToParameter(key.AsSpan(), routeBuffer.Value, out int written, out var assignmentLambda);
+
+                            if (assignmentLambda is null || state != DecodeState.Initialized || written == 0)
+                            {
+                                throw new DeserializationException("Type incorrect");
+                            }
+
+                            if (type == ObjectType.Map)
+                            {
+                                int count = size;
+                                for (int mapIndex = 0; mapIndex < count; ++mapIndex)
+                                {
+                                    // string -> string
+                                    type = CtrlData(offset, out size, out offset);
+
+                                    long pointer = offset;
+                                    if (type == ObjectType.Pointer)
+                                    {
+                                        pointer = DecodePointer(offset, size, out offset);
+                                        Debug.Assert(_followPointers);
+                                    }
+
+                                    type = CtrlData(pointer, out size, out pointerOffset);
+                                    using PooledArray<byte> kvKey = new (size);
+                                    
+                                    _database.AsSpan(pointerOffset, size).CopyTo(kvKey.Value);
+
+                                    type = CtrlData(offset, out size, out offset);
+                                    using PooledArray<byte> value = new (size);
+
+                                    _database.AsSpan(offset, size).CopyTo(value.Value);
+                                    offset += size;
+
+                                    using PooledArray<byte> kvBuffer = new(kvKey.Length + value.Length + 2);
+
+                                    kvKey.Value.CopyTo(kvBuffer.Value);
+                                    kvBuffer.Value[kvKey.Length] = (byte)'\r';
+                                    kvBuffer.Value[kvKey.Length + 1] = (byte)'\n';
+
+                                    value.Value.CopyTo(kvBuffer.Value.Slice(kvKey.Length + 2));
+                                    assignmentLambda(routeBuffer.Value, ref country, kvBuffer.Memory);
+                                }
+                            }
+                        }
+                    }
+                    
+                    returnValue.Country = country;
+                }
+                else if (key.Equals("continent"u8))
+                {
+                    // We are decoding the continent object.
+                    ValueContinent continent = new();
+
+                    int paramCount = size;
+                    for (int decodeParametersIndex = 0; decodeParametersIndex < paramCount; ++decodeParametersIndex)
+                    {
+                        key = DecodeKey(offset, out offset);
+                        type = CtrlData(offset, out size, out offset);
+
+                        if (type != ObjectType.Map)
+                        {
+                            DecodeState state = continent.TryAssignToParameter(key.AsSpan(), null, out int _, out var assignmentLambda);
+                            if (assignmentLambda is null || state != DecodeState.Assigned)
+                            {
+                                throw new DeserializationException("Type incorrect");
+                            }
+
+                            pointerOffset = offset;
+                            readPointer = false;
+                            if (type == ObjectType.Pointer)
+                            {
+                                readPointer = true;
+                                long pointer = offset;
+                                pointer = DecodePointer(offset, size, out offset);
+                                Debug.Assert(_followPointers);
+                                type = CtrlData(pointer, out size, out pointerOffset);
+                            }
+
+                            Debug.Assert(state == DecodeState.Assigned && assignmentLambda is not null);
+                            assignmentLambda(null, ref continent, _database.AsMemory(pointerOffset, size));
+
+                            if (!readPointer)
+                            {
+                                offset += size;
+                            }
+                        }
+                        else
+                        {
+                            // This is a complex object. Call TryAssignToParameter. Assert
+                            // that the complex type is initialized, but not assigned.
+                            DecodeState state = continent.TryAssignToParameter(key.AsSpan(), routeBuffer.Value, out int written, out var assignmentLambda);
+
+                            if (assignmentLambda is null || state != DecodeState.Initialized || written == 0)
+                            {
+                                throw new DeserializationException("Type incorrect");
+                            }
+
+                            if (type == ObjectType.Map)
+                            {
+                                int count = size;
+                                for (int mapIndex = 0; mapIndex < count; ++mapIndex)
+                                {
+                                    // string -> string
+                                    type = CtrlData(offset, out size, out offset);
+
+                                    long pointer = offset;
+                                    if (type == ObjectType.Pointer)
+                                    {
+                                        pointer = DecodePointer(offset, size, out offset);
+                                        Debug.Assert(_followPointers);
+                                    }
+
+                                    type = CtrlData(pointer, out size, out pointerOffset);
+                                    using PooledArray<byte> kvKey = new (size);
+                                    
+                                    _database.AsSpan(pointerOffset, size).CopyTo(kvKey.Value);
+
+                                    type = CtrlData(offset, out size, out offset);
+                                    using PooledArray<byte> value = new (size);
+
+                                    _database.AsSpan(offset, size).CopyTo(value.Value);
+                                    offset += size;
+
+                                    using PooledArray<byte> kvBuffer = new(kvKey.Length + value.Length + 2);
+
+                                    kvKey.Value.CopyTo(kvBuffer.Value);
+                                    kvBuffer.Value[kvKey.Length] = (byte)'\r';
+                                    kvBuffer.Value[kvKey.Length + 1] = (byte)'\n';
+
+                                    value.Value.CopyTo(kvBuffer.Value.Slice(kvKey.Length + 2));
+                                    assignmentLambda(routeBuffer.Value, ref continent, kvBuffer.Memory);
+                                }
+                            }
+                        }
+                    }
+
+                    returnValue.Continent = continent;
+                }
+                else if (key.Equals("city"u8))
+                {
+                    // We are decoding the city object.
+                    ValueCity city = new();
+
+                    int paramCount = size;
+                    for (int decodeParameterIndex = 0; decodeParameterIndex < paramCount; ++decodeParameterIndex)
+                    {
+                        key = DecodeKey(offset, out offset);
+                        type = CtrlData(offset, out size, out offset);
+
+                        if (type != ObjectType.Map)
+                        {
+                            DecodeState state = city.TryAssignToParameter(key.AsSpan(), null, out int _, out var assignmentLambda);
+                            if (assignmentLambda is null || state != DecodeState.Assigned)
+                            {
+                                throw new DeserializationException("Type incorrect");
+                            }
+
+                            pointerOffset = offset;
+                            readPointer = false;
+                            if (type == ObjectType.Pointer)
+                            {
+                                readPointer = true;
+                                long pointer = offset;
+                                pointer = DecodePointer(offset, size, out offset);
+                                Debug.Assert(_followPointers);
+                                type = CtrlData(pointer, out size, out pointerOffset);
+                            }
+
+                            Debug.Assert(state == DecodeState.Assigned && assignmentLambda is not null);
+                            assignmentLambda(null, ref city, _database.AsMemory(pointerOffset, size));
+
+                            if (!readPointer)
+                            {
+                                offset += size;
+                            }
+                        }
+                        else
+                        {
+                            // This is a complex object. Call TryAssignToParameter. Assert
+                            // that the complex type is initialized, but not assigned.
+                            DecodeState state = city.TryAssignToParameter(key.AsSpan(), routeBuffer.Value, out int written, out var assignmentLambda);
+
+                            if (assignmentLambda is null || state != DecodeState.Initialized || written == 0)
+                            {
+                                throw new DeserializationException("Type incorrect");
+                            }
+
+                            if (type == ObjectType.Map)
+                            {
+                                int count = size;
+                                for (int mapIndex = 0; mapIndex < count; ++mapIndex)
+                                {
+                                    // string -> string
+                                    type = CtrlData(offset, out size, out offset);
+
+                                    long pointer = offset;
+                                    if (type == ObjectType.Pointer)
+                                    {
+                                        pointer = DecodePointer(offset, size, out offset);
+                                        Debug.Assert(_followPointers);
+                                    }
+
+                                    type = CtrlData(pointer, out size, out pointerOffset);
+                                    using PooledArray<byte> kvKey = new (size);
+                                    
+                                    _database.AsSpan(pointerOffset, size).CopyTo(kvKey.Value);
+
+                                    type = CtrlData(offset, out size, out offset);
+                                    using PooledArray<byte> value = new (size);
+
+                                    _database.AsSpan(offset, size).CopyTo(value.Value);
+                                    offset += size;
+
+                                    using PooledArray<byte> kvBuffer = new(kvKey.Length + value.Length + 2);
+
+                                    kvKey.Value.CopyTo(kvBuffer.Value);
+                                    kvBuffer.Value[kvKey.Length] = (byte)'\r';
+                                    kvBuffer.Value[kvKey.Length + 1] = (byte)'\n';
+
+                                    value.Value.CopyTo(kvBuffer.Value.Slice(kvKey.Length + 2));
+                                    assignmentLambda(routeBuffer.Value, ref city, kvBuffer.Memory);
+                                }
+                            }
+                        }
+                    }
+                    
+                    returnValue.City = city;
+                }
+                else if (key.Equals("location"u8))
+                {
+                    ValueLocation location = new();
+
+                    // We are decoding the registeredCountry object.
+                    int paramCount = size;
+                    for (int decodeParameterIndex = 0; decodeParameterIndex < paramCount; ++decodeParameterIndex)
+                    {
+                        key = DecodeKey(offset, out offset);
+                        type = CtrlData(offset, out size, out offset);
+
+                        if (type != ObjectType.Map)
+                        {
+                            DecodeState state = location.TryAssignToParameter(key.AsSpan(), null, out int _, out var assignmentLambda);
+                            if (assignmentLambda is null || state != DecodeState.Assigned)
+                            {
+                                throw new DeserializationException("Type incorrect");
+                            }
+
+                            pointerOffset = offset;
+                            readPointer = false;
+                            if (type == ObjectType.Pointer)
+                            {
+                                readPointer = true;
+                                long pointer = offset;
+                                pointer = DecodePointer(offset, size, out offset);
+                                Debug.Assert(_followPointers);
+                                type = CtrlData(pointer, out size, out pointerOffset);
+                            }
+
+                            Debug.Assert(state == DecodeState.Assigned && assignmentLambda is not null);
+                            assignmentLambda(null, ref location, _database.AsMemory(pointerOffset, size));
+
+                            if (!readPointer)
+                            {
+                                offset += size;
+                            }
+                        }
+                        else
+                        {
+                            // This is a complex object. Call TryAssignToParameter. Assert
+                            // that the complex type is initialized, but not assigned.
+                            DecodeState state = location.TryAssignToParameter(key.AsSpan(), routeBuffer.Value, out int written, out var assignmentLambda);
+
+                            if (assignmentLambda is null || state != DecodeState.Initialized || written == 0)
+                            {
+                                throw new DeserializationException("Type incorrect");
+                            }
+
+                            if (type == ObjectType.Map)
+                            {
+                                int count = size;
+                                for (int mapIndex = 0; mapIndex < count; ++mapIndex)
+                                {
+                                    // string -> string
+                                    type = CtrlData(offset, out size, out offset);
+
+                                    pointerOffset = offset;
+                                    if (type == ObjectType.Pointer)
+                                    {
+                                        long pointer = offset;
+                                        pointer = DecodePointer(offset, size, out offset);
+                                        Debug.Assert(_followPointers);
+                                        type = CtrlData(pointer, out size, out pointerOffset);
+                                    }
+
+                                    using PooledArray<byte> kvKey = new (size);
+                                    
+                                    _database.AsSpan(pointerOffset, size).CopyTo(kvKey.Value);
+
+                                    type = CtrlData(offset, out size, out offset);
+                                    using PooledArray<byte> value = new (size);
+
+                                    _database.AsSpan(offset, size).CopyTo(value.Value);
+                                    offset += size;
+
+                                    using PooledArray<byte> kvBuffer = new(kvKey.Length + value.Length + 2);
+
+                                    kvKey.Value.CopyTo(kvBuffer.Value);
+                                    kvBuffer.Value[kvKey.Length] = (byte)'\r';
+                                    kvBuffer.Value[kvKey.Length + 1] = (byte)'\n';
+
+                                    value.Value.CopyTo(kvBuffer.Value.Slice(kvKey.Length + 2));
+                                    assignmentLambda(routeBuffer.Value, ref location, kvBuffer.Memory);
+                                }
+                            }
+                        }
+                    }
+
+                    returnValue.Location = location;
+                }
+                else if (key.Equals("registered_country"u8))
+                {
+                    // We are decoding the registeredCountry object.
+                    ValueCountry country = new();
+
+                    int paramCount = size;
+                    for (int decodeParameterIndex = 0; decodeParameterIndex < paramCount; ++decodeParameterIndex)
+                    {
+                        key = DecodeKey(offset, out offset);
+                        type = CtrlData(offset, out size, out offset);
+
+                        if (type != ObjectType.Map)
+                        {
+                            DecodeState state = country.TryAssignToParameter(key.AsSpan(), null, out int _, out var assignmentLambda);
+                            if (assignmentLambda is null || state != DecodeState.Assigned)
+                            {
+                                throw new DeserializationException("Type incorrect");
+                            }
+
+                            pointerOffset = offset;
+                            readPointer = false;
+                            if (type == ObjectType.Pointer)
+                            {
+                                readPointer = true;
+                                long pointer = offset;
+                                pointer = DecodePointer(offset, size, out offset);
+                                Debug.Assert(_followPointers);
+                                type = CtrlData(pointer, out size, out pointerOffset);
+                            }
+
+                            Debug.Assert(state == DecodeState.Assigned && assignmentLambda is not null);
+                            assignmentLambda(null, ref country, _database.AsMemory(pointerOffset, size));
+
+                            if (!readPointer)
+                            {
+                                offset += size;
+                            }
+                        }
+                        else
+                        {
+                            // This is a complex object. Call TryAssignToParameter. Assert
+                            // that the complex type is initialized, but not assigned.
+                            DecodeState state = country.TryAssignToParameter(key.AsSpan(), routeBuffer.Value, out int written, out var assignmentLambda);
+
+                            if (assignmentLambda is null || state != DecodeState.Initialized || written == 0)
+                            {
+                                throw new DeserializationException("Type incorrect");
+                            }
+
+                            if (type == ObjectType.Map)
+                            {
+                                int count = size;
+                                for (int mapIndex = 0; mapIndex < count; ++mapIndex)
+                                {
+                                    // string -> string
+                                    type = CtrlData(offset, out size, out offset);
+
+                                    long pointer = offset;
+                                    if (type == ObjectType.Pointer)
+                                    {
+                                        pointer = DecodePointer(offset, size, out offset);
+                                        Debug.Assert(_followPointers);
+                                    }
+
+                                    type = CtrlData(pointer, out size, out pointerOffset);
+                                    using PooledArray<byte> kvKey = new (size);
+                                    
+                                    _database.AsSpan(pointerOffset, size).CopyTo(kvKey.Value);
+
+                                    type = CtrlData(offset, out size, out offset);
+                                    using PooledArray<byte> value = new (size);
+
+                                    _database.AsSpan(offset, size).CopyTo(value.Value);
+                                    offset += size;
+
+                                    using PooledArray<byte> kvBuffer = new(kvKey.Length + value.Length + 2);
+
+                                    kvKey.Value.CopyTo(kvBuffer.Value);
+                                    kvBuffer.Value[kvKey.Length] = (byte)'\r';
+                                    kvBuffer.Value[kvKey.Length + 1] = (byte)'\n';
+
+                                    value.Value.CopyTo(kvBuffer.Value.Slice(kvKey.Length + 2));
+                                    assignmentLambda(routeBuffer.Value, ref country, kvBuffer.Memory);
+                                }
+                            }
+                        }
+                    }
+
+                    returnValue.RegisteredCountry = country;
+                }
+            }
+
+            return true;
+        }
+
+#endif
 
         private object Decode(Type expectedType, long offset, out long outOffset, InjectableValues? injectables = null, Network? network = null)
         {
@@ -273,7 +784,12 @@ namespace MaxMind.Db
         {
             ReflectionUtil.CheckType(expectedType, typeof(string));
 
+#if NET10_0_OR_GREATER
+            ReadOnlyMemory<byte> lookupString = _database.AsMemory(offset, size);
+            return InternedStrings.GetString(lookupString);
+#else
             return _database.ReadString(offset, size);
+#endif
         }
 
         private byte[] DecodeBytes(Type expectedType, long offset, int size)
@@ -366,6 +882,68 @@ namespace MaxMind.Db
             Network? network
             )
         {
+#if NETCOREAPP3_1_OR_GREATER
+
+#endif // NETCOREAPP3_1_OR_GREATER
+            var constructor = _typeAcivatorCreator.GetActivator(expectedType);
+
+#if !NETSTANDARD2_0
+            // N.B. Rent can return a larger arrays. This is fine because constructors allow arrays larger than the
+            // number of parameters.
+            object?[] parameters = ArrayPool<object?>.Shared.Rent(constructor.DefaultParameters.Length);
+#else
+            object?[] parameters = new object?[constructor.DefaultParameters.Length];
+#endif
+            constructor.DefaultParameters.CopyTo(parameters, 0);
+
+            for (var i = 0; i < size; i++)
+            {
+                var key = DecodeKey(offset, out offset);
+                var span = key.AsSpan();
+                if (constructor.DeserializationParameters.TryGetValue(key, out var v))
+                {
+                    var param = v;
+                    var paramType = param.ParameterType;
+                    var value = Decode(paramType, offset, out offset, injectables, network);
+                    parameters[param.Position] = value;
+                }
+                else
+                {
+                    offset = NextValueOffset(offset, 1);
+                }
+            }
+
+            SetInjectables(constructor, parameters, injectables);
+            SetNetwork(constructor, parameters, network);
+            SetAlwaysCreatedParams(constructor, parameters, injectables, network);
+
+            outOffset = offset;
+            object obj = constructor.Activator(parameters);
+
+#if !NETSTANDARD2_0
+            ArrayPool<object?>.Shared.Return(parameters);
+#endif
+
+            return obj;
+        }
+
+        private void DecodeMapToTypeValue<T>(
+            Type expectedType,
+            long offset,
+            int size,
+            out long outOffset,
+            out T returnValue,
+            InjectableValues? injectables,
+            Network? network
+            ) where T : struct
+        {
+            returnValue = default;
+            PropertyInfo[] propertyInfos = expectedType.GetProperties();
+            
+
+#if NETCOREAPP3_1_OR_GREATER
+
+#endif // NETCOREAPP3_1_OR_GREATER
             var constructor = _typeAcivatorCreator.GetActivator(expectedType);
 
 #if !NETSTANDARD2_0
@@ -398,13 +976,14 @@ namespace MaxMind.Db
             SetAlwaysCreatedParams(constructor, parameters, injectables, network);
 
             outOffset = offset;
-            object obj = constructor.Activator(parameters);
+            T obj = (T)constructor.Activator(parameters);
 
 #if !NETSTANDARD2_0
             ArrayPool<object?>.Shared.Return(parameters);
 #endif
 
-            return obj;
+            returnValue = obj;
+            return;
         }
 
         private void SetAlwaysCreatedParams(

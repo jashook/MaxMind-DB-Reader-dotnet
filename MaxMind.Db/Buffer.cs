@@ -19,6 +19,9 @@ namespace MaxMind.Db
 
         public abstract byte ReadOne(long offset);
 
+        public abstract ReadOnlySpan<byte> AsSpan(long offset, int count);
+        public abstract ReadOnlyMemory<byte> AsMemory(long offset, int count);
+
         public long Length { get; protected set; }
 
         /// <summary>

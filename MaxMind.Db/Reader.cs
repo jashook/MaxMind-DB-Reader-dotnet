@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 
 #endregion
@@ -106,7 +107,8 @@ namespace MaxMind.Db
         ///     Initializes a new instance of the <see cref="Reader" /> class.
         /// </summary>
         /// <param name="file">The file.</param>
-        public Reader(string file) : this(file, FileAccessMode.MemoryMapped)
+        /// <param name="factory">Optional allocator factory.</param>
+        public Reader(string file, IAllocatorFactory? factory = null) : this(file, FileAccessMode.MemoryMapped)
         {
         }
 
@@ -115,7 +117,8 @@ namespace MaxMind.Db
         /// </summary>
         /// <param name="file">The MaxMind DB file.</param>
         /// <param name="mode">The mode by which to access the DB file.</param>
-        public Reader(string file, FileAccessMode mode) : this(BufferForMode(file, mode), file)
+        /// <param name="factory">Optional allocator factory.</param>
+        public Reader(string file, FileAccessMode mode, IAllocatorFactory? factory = null) : this(BufferForMode(file, mode), file, factory)
         {
         }
 
@@ -127,12 +130,13 @@ namespace MaxMind.Db
         /// </summary>
         /// <param name="stream">The stream to use. It will be used from its
         ///                      current position. </param>
+        /// <param name="factory">Optional allocator factory.</param>
         /// <exception cref="ArgumentNullException"></exception>
-        public Reader(Stream stream) : this(new ArrayBuffer(stream), null)
+        public Reader(Stream stream, IAllocatorFactory? factory = null) : this(new ArrayBuffer(stream), null, factory)
         {
         }
 
-        private Reader(Buffer buffer, string? file)
+        private Reader(Buffer buffer, string? file, IAllocatorFactory? factory = null)
         {
             _fileName = file;
             _database = buffer;
@@ -144,7 +148,7 @@ namespace MaxMind.Db
             _nodeByteSize = Metadata.NodeByteSize;
             _nodeCount = Metadata.NodeCount;
             _recordSize = Metadata.RecordSize;
-            Decoder = new Decoder(_database, Metadata.SearchTreeSize + DataSectionSeparatorSize);
+            Decoder = new Decoder(_database, Metadata.SearchTreeSize + DataSectionSeparatorSize, factory: factory);
 
             if (_dbIPVersion == 6)
             {
@@ -234,6 +238,20 @@ namespace MaxMind.Db
             return Find<T>(ipAddress, out _, injectables);
         }
 
+#if NET10_0_OR_GREATER
+        /// <summary>
+        /// Value type ref return
+        /// </summary>
+        /// <param name="ipAddress"></param>
+        /// <param name="returnValue"></param>
+        /// <param name="injectables"></param>
+        public bool FindCityResponse(IPAddress ipAddress, out ValueCityResponse returnValue, InjectableValues? injectables = null)
+        {
+            return FindCityResponse(ipAddress, out _, out returnValue, injectables);
+        }
+
+#endif
+
         /// <summary>
         ///     Finds the data related to the specified address.
         /// </summary>
@@ -247,6 +265,24 @@ namespace MaxMind.Db
             var network = new Network(ipAddress, prefixLength);
             return pointer == 0 ? null : ResolveDataPointer<T>(pointer, injectables, network);
         }
+
+#if NET10_0_OR_GREATER
+
+        /// <summary>
+        ///     Finds the data related to the specified address.
+        /// </summary>
+        /// <param name="ipAddress">The IP address.</param>
+        /// <param name="prefixLength">The network prefix length for the network record in the database containing the IP address looked up.</param>
+        /// <param name="injectables">Value to inject during deserialization</param>
+        /// <param name="returnValue"></param>
+        public bool FindCityResponse(IPAddress ipAddress, out int prefixLength, out ValueCityResponse returnValue, InjectableValues? injectables = null)
+        {
+            var pointer = FindAddressInTree(ipAddress, out prefixLength);
+            var network = new Network(ipAddress, prefixLength);
+            return ResolveDataPointerCityResponse(pointer, injectables, network, out returnValue);
+        }
+
+#endif
 
         /// <summary>
         /// <para>Get an enumerator that iterates all data nodes in the database. Do not modify the object as it may be cached.</para>
@@ -329,6 +365,24 @@ namespace MaxMind.Db
 
             return Decoder.Decode<T>(resolved, out _, injectables, network);
         }
+
+#if NET10_0_OR_GREATER
+
+        private bool ResolveDataPointerCityResponse(int pointer, InjectableValues? injectables, Network? network, out ValueCityResponse returnValue)
+        {
+            var resolved = pointer + _dataPointerOffset;
+
+            if (resolved >= _database.Length)
+            {
+                throw new InvalidDatabaseException(
+                    "The MaxMind Db file's search tree is corrupt: "
+                    + "contains pointer larger than the database.");
+            }
+
+            return Decoder.DecodeCityResponse(out returnValue, resolved, out _, injectables, network);
+        }
+
+#endif
 
         private int FindAddressInTree(IPAddress address, out int prefixLength)
         {

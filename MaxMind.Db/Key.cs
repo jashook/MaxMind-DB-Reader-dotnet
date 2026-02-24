@@ -41,6 +41,24 @@ namespace MaxMind.Db
             return true;
         }
 
+        public bool Equals(ReadOnlySpan<byte> rhs)
+        {
+            if (size != rhs.Length)
+            {
+                return false;
+            }
+
+            for (int index = 0; index < size; ++index)
+            {
+                if (buffer.ReadOne(offset + index) != rhs[index])
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
         public override bool Equals(object? obj)
         {
             if (obj == null || typeof(Key) != obj.GetType())
@@ -54,6 +72,16 @@ namespace MaxMind.Db
         public override int GetHashCode()
         {
             return hashCode;
+        }
+
+        public ReadOnlySpan<byte> AsSpan()
+        {
+            return buffer.AsSpan(offset, size);
+        }
+
+        public ReadOnlyMemory<byte> AsMemory()
+        {
+            return buffer.AsMemory(offset, size);
         }
     }
 }

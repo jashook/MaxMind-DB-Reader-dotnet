@@ -98,6 +98,16 @@ namespace MaxMind.Db
             return bytes;
         }
 
+        public override ReadOnlySpan<byte> AsSpan(long offset, int count)
+        {
+            return _fileBytes.AsSpan().Slice((int)offset, count);
+        }
+
+        public override ReadOnlyMemory<byte> AsMemory(long offset, int count)
+        {
+            return _fileBytes.AsMemory().Slice((int)offset, count);
+        }
+
         public override byte ReadOne(long offset) => _fileBytes[offset];
 
         public override string ReadString(long offset, int count)

@@ -23,7 +23,7 @@ public class CityBenchmark
         const string dbPathVarName = "MAXMIND_BENCHMARK_DB";
         string dbPath = Environment.GetEnvironmentVariable(dbPathVarName) ??
                         throw new InvalidOperationException($"{dbPathVarName} was not set");
-        _reader = new Reader(dbPath);
+        _reader = new Reader(dbPath, FileAccessMode.Memory);
 
         const string ipAddressesVarName = "MAXMIND_BENCHMARK_IP_ADDRESSES";
         string ipAddressesStr = Environment.GetEnvironmentVariable(ipAddressesVarName) ?? "";
@@ -64,6 +64,24 @@ public class CityBenchmark
 
         return x;
     }
+
+#if NET10_0_OR_GREATER
+    [Benchmark]
+    public int ValueCity()
+    {
+        int x = 0;
+        foreach (var ipAddress in _ipAddresses)
+        {
+            ValueCityResponse cityResponse;
+            if (_reader.FindCityResponse(ipAddress, out cityResponse))
+            {
+                x += 1;
+            }
+        }
+
+        return x;
+    }
+#endif
 }
 
 public abstract class AbstractCountryResponse

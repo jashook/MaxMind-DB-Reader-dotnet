@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="../MaxMind.Db.Benchmark/MaxMind.Db.Benchmark.csproj" />
+  <Project Path="../MaxMind.Db/MaxMind.Db.csproj" />
+  <Project Path="test.csproj" />
+</Solution>
